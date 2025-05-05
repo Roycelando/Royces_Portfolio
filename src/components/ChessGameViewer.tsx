@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 import styled from 'styled-components';
@@ -8,7 +8,10 @@ import {
   faStepForward, 
   faFastBackward, 
   faFastForward,
-  faSave
+  faSave,
+  faRobot,
+  faClock,
+  faTrophy
 } from '@fortawesome/free-solid-svg-icons';
 
 const ChessContainer = styled.div`
@@ -111,19 +114,332 @@ const GameItem = styled.li`
   }
 `;
 
+const GameStats = styled.div`
+  background-color: #2a2a2a;
+  padding: 1rem;
+  border-radius: 8px;
+  border: 1px solid #4a4a4a;
+  margin-top: 1rem;
+`;
+
+const StatsTitle = styled.h3`
+  color: #00ff9d;
+  margin-bottom: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+`;
+
+const StatsGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+`;
+
+const StatItem = styled.div`
+  color: #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+`;
+
+const StatValue = styled.span`
+  font-size: 1.5rem;
+  color: #00ff9d;
+  font-weight: bold;
+`;
+
+const StatLabel = styled.span`
+  font-size: 0.8rem;
+  color: #888;
+`;
+
+const Timer = styled.div`
+  color: #00ff9d;
+  font-size: 1.2rem;
+  font-weight: bold;
+  text-align: center;
+  margin: 1rem 0;
+`;
+
+const DifficultySelector = styled.div`
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1rem;
+`;
+
+const DifficultyButton = styled(Button)<{ isActive: boolean }>`
+  flex: 1;
+  background-color: ${props => props.isActive ? '#444' : '#333'};
+  border: 1px solid ${props => props.isActive ? '#00ff9d' : '#4a4a4a'};
+`;
+
 interface SavedGame {
   name: string;
   pgn: string;
 }
 
+interface GameStats {
+  wins: number;
+  losses: number;
+  draws: number;
+  timeLeft: number;
+}
+
+type PieceType = 'p' | 'n' | 'b' | 'r' | 'q' | 'k';
+
+// Material values for pieces
+const PIECE_VALUES: Record<string, number> = {
+  p: 100,  // pawn
+  n: 320,  // knight
+  b: 330,  // bishop
+  r: 500,  // rook
+  q: 900,  // queen
+  k: 20000 // king
+};
+
+const CENTER_SQUARES = ['d4', 'd5', 'e4', 'e5'];
+const KING_SAFETY_ZONES = {
+  white: ['f1', 'g1', 'h1', 'f2', 'g2', 'h2'],
+  black: ['f8', 'g8', 'h8', 'f7', 'g7', 'h7']
+};
+
 const ChessGameViewer: React.FC = () => {
-  const [game, setGame] = useState(new Chess());
+  const [game, setGame] = useState<Chess>(new Chess());
   const [fen, setFen] = useState(game.fen());
   const [pgnInput, setPgnInput] = useState('');
   const [savedGames, setSavedGames] = useState<SavedGame[]>([]);
   const [gameName, setGameName] = useState('');
   const [currentMoveIndex, setCurrentMoveIndex] = useState(-1);
-  const [moveHistory, setMoveHistory] = useState<string[]>([]);
+  const [history, setHistory] = useState<string[]>([]);
+  const [isPlayingAI, setIsPlayingAI] = useState(false);
+  const [difficulty, setDifficulty] = useState<'beginner' | 'intermediate' | 'advanced'>('intermediate');
+  const [stats, setStats] = useState<GameStats>({
+    wins: 0,
+    losses: 0,
+    draws: 0,
+    timeLeft: 300 // 5 minutes in seconds
+  });
+  const [isWhite, setIsWhite] = useState(true);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  const [isAIThinking, setIsAIThinking] = useState(false);
+  const aiMoveRef = useRef<number | null>(null);
+
+  const evaluateBoard = (game: Chess): number => {
+    let score = 0;
+    const board = game.board();
+
+    // Quick material evaluation
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 8; j++) {
+        const piece = board[i][j];
+        if (piece) {
+          score += piece.color === 'w' ? PIECE_VALUES[piece.type] : -PIECE_VALUES[piece.type];
+        }
+      }
+    }
+
+    return score;
+  };
+
+  const orderMoves = (game: Chess, moves: string[]): string[] => {
+    return moves.sort((a, b) => {
+      // Try captures first
+      const moveA = game.move(a);
+      if (moveA) {
+        game.undo();
+        const moveB = game.move(b);
+        if (moveB) {
+          game.undo();
+          
+          if (moveA.captured && !moveB.captured) return -1;
+          if (!moveA.captured && moveB.captured) return 1;
+          
+          // Then promotions
+          if (moveA.promotion && !moveB.promotion) return -1;
+          if (!moveA.promotion && moveB.promotion) return 1;
+        } else {
+          game.undo();
+          return -1; // Move B is invalid, prefer move A
+        }
+      } else {
+        game.undo();
+        return 1; // Move A is invalid, prefer move B
+      }
+      
+      return 0;
+    });
+  };
+
+  const minimax = (game: Chess, depth: number, alpha: number, beta: number, maximizingPlayer: boolean): number => {
+    if (depth === 0 || game.isGameOver()) {
+      return evaluateBoard(game);
+    }
+
+    const moves = orderMoves(game, game.moves());
+
+    if (maximizingPlayer) {
+      let maxEval = -Infinity;
+      for (const move of moves) {
+        game.move(move);
+        const evaluation = minimax(game, depth - 1, alpha, beta, false);
+        game.undo();
+        maxEval = Math.max(maxEval, evaluation);
+        alpha = Math.max(alpha, evaluation);
+        if (beta <= alpha) break;
+      }
+      return maxEval;
+    } else {
+      let minEval = Infinity;
+      for (const move of moves) {
+        game.move(move);
+        const evaluation = minimax(game, depth - 1, alpha, beta, true);
+        game.undo();
+        minEval = Math.min(minEval, evaluation);
+        beta = Math.min(beta, evaluation);
+        if (beta <= alpha) break;
+      }
+      return minEval;
+    }
+  };
+
+  const findBestMove = (game: Chess, depth: number): string => {
+    const moves = game.moves();
+    if (moves.length === 0) return '';
+    
+    const orderedMoves = orderMoves(game, moves);
+    let bestMove = orderedMoves[0];
+    let bestScore = -Infinity;
+
+    for (const move of orderedMoves) {
+      const moveResult = game.move(move);
+      if (moveResult) {
+        const score = -minimax(game, depth - 1, -Infinity, Infinity, false);
+        game.undo();
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestMove = move;
+        }
+      }
+    }
+
+    return bestMove;
+  };
+
+  useEffect(() => {
+    if (isPlayingAI && stats.timeLeft > 0) {
+      timerRef.current = setInterval(() => {
+        setStats(prev => ({ ...prev, timeLeft: prev.timeLeft - 1 }));
+      }, 1000);
+    }
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, [isPlayingAI]);
+
+  useEffect(() => {
+    const makeAIMove = () => {
+      if (game && !game.isGameOver() && game.turn() === 'b' && isPlayingAI && !isAIThinking) {
+        setIsAIThinking(true);
+        
+        // Clear any pending AI move
+        if (aiMoveRef.current) {
+          clearTimeout(aiMoveRef.current);
+        }
+
+        const depth = difficulty === 'beginner' ? 1 : difficulty === 'intermediate' ? 2 : 3;
+        const bestMove = findBestMove(game, depth);
+        
+        if (bestMove) {
+          try {
+            const moveResult = game.move(bestMove);
+            if (moveResult) {
+              // Batch state updates
+              setFen(game.fen());
+              setHistory(game.history());
+            }
+          } catch (e) {
+            console.error('Invalid move:', e);
+          }
+        }
+        setIsAIThinking(false);
+      }
+    };
+
+    // Only trigger AI move when it's actually the AI's turn
+    if (game?.turn() === 'b' && isPlayingAI && !isAIThinking) {
+      aiMoveRef.current = window.setTimeout(makeAIMove, 0);
+    }
+
+    return () => {
+      if (aiMoveRef.current) {
+        clearTimeout(aiMoveRef.current);
+      }
+    };
+  }, [game?.turn(), isPlayingAI, difficulty]);
+
+  const startAIGame = (color: 'white' | 'black') => {
+    setIsPlayingAI(true);
+    setIsWhite(color === 'white');
+    const newGame = new Chess();
+    setGame(newGame);
+    setFen(newGame.fen());
+    setCurrentMoveIndex(-1);
+    setHistory([]);
+    setStats(prev => ({ ...prev, timeLeft: 300 }));
+  };
+
+  const onDrop = (sourceSquare: string, targetSquare: string) => {
+    if (!isPlayingAI || (isWhite && game.turn() === 'w') || (!isWhite && game.turn() === 'b')) {
+      try {
+        const move = game.move({
+          from: sourceSquare,
+          to: targetSquare,
+          promotion: 'q',
+        });
+
+        if (move === null) return false;
+        
+        // Batch state updates
+        setFen(game.fen());
+        setCurrentMoveIndex(game.history().length - 1);
+        setHistory(game.history());
+
+        if (game.isGameOver()) {
+          setIsPlayingAI(false);
+          if (timerRef.current) {
+            clearInterval(timerRef.current);
+          }
+          updateStats(game);
+        }
+
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+    return false;
+  };
+
+  const updateStats = (game: Chess) => {
+    if (game.isDraw()) {
+      setStats(prev => ({ ...prev, draws: prev.draws + 1 }));
+    } else if (game.turn() === 'w') {
+      setStats(prev => ({ ...prev, losses: prev.losses + 1 }));
+    } else {
+      setStats(prev => ({ ...prev, wins: prev.wins + 1 }));
+    }
+  };
+
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
 
   const loadPgn = () => {
     try {
@@ -138,7 +454,7 @@ const ChessGameViewer: React.FC = () => {
       setGame(newGame);
       setFen(newGame.fen());
       setCurrentMoveIndex(newGame.history().length - 1);
-      setMoveHistory(newGame.history());
+      setHistory(newGame.history());
     } catch (e) {
       alert('Invalid PGN format. Please make sure the PGN contains valid moves.');
       console.error('PGN loading error:', e);
@@ -158,7 +474,7 @@ const ChessGameViewer: React.FC = () => {
       setGame(newGame);
       setFen(newGame.fen());
       setCurrentMoveIndex(newGame.history().length - 1);
-      setMoveHistory(newGame.history());
+      setHistory(newGame.history());
       setPgnInput(cleanPgn);
     } catch (e) {
       alert('Error loading saved game');
@@ -167,11 +483,11 @@ const ChessGameViewer: React.FC = () => {
   };
 
   const goToMove = (index: number) => {
-    if (index < -1 || index >= moveHistory.length) return;
+    if (index < -1 || index >= history.length) return;
 
     const newGame = new Chess();
     for (let i = 0; i <= index; i++) {
-      newGame.move(moveHistory[i]);
+      newGame.move(history[i]);
     }
     
     setGame(newGame);
@@ -180,27 +496,9 @@ const ChessGameViewer: React.FC = () => {
   };
 
   const goToBeginning = () => goToMove(-1);
-  const goToEnd = () => goToMove(moveHistory.length - 1);
+  const goToEnd = () => goToMove(history.length - 1);
   const goToPreviousMove = () => currentMoveIndex > -1 && goToMove(currentMoveIndex - 1);
-  const goToNextMove = () => currentMoveIndex < moveHistory.length - 1 && goToMove(currentMoveIndex + 1);
-
-  const onDrop = (sourceSquare: string, targetSquare: string) => {
-    try {
-      const move = game.move({
-        from: sourceSquare,
-        to: targetSquare,
-        promotion: 'q',
-      });
-
-      if (move === null) return false;
-      setFen(game.fen());
-      setCurrentMoveIndex(game.history().length - 1);
-      setMoveHistory(game.history());
-      return true;
-    } catch (e) {
-      return false;
-    }
-  };
+  const goToNextMove = () => currentMoveIndex < history.length - 1 && goToMove(currentMoveIndex + 1);
 
   const saveGame = () => {
     if (!gameName.trim()) {
@@ -217,6 +515,10 @@ const ChessGameViewer: React.FC = () => {
     setGameName('');
   };
 
+  const handleDifficultyChange = (newDifficulty: 'beginner' | 'intermediate' | 'advanced') => {
+    setDifficulty(newDifficulty);
+  };
+
   return (
     <ChessContainer>
       <MainSection>
@@ -227,20 +529,56 @@ const ChessGameViewer: React.FC = () => {
             boardWidth={500}
           />
           <Controls>
-            <Button onClick={goToBeginning} disabled={moveHistory.length === 0}>
+            <Button onClick={goToBeginning} disabled={history.length === 0}>
               <FontAwesomeIcon icon={faFastBackward} />
             </Button>
             <Button onClick={goToPreviousMove} disabled={currentMoveIndex <= -1}>
               <FontAwesomeIcon icon={faStepBackward} />
             </Button>
-            <Button onClick={goToNextMove} disabled={currentMoveIndex >= moveHistory.length - 1}>
+            <Button onClick={goToNextMove} disabled={currentMoveIndex >= history.length - 1}>
               <FontAwesomeIcon icon={faStepForward} />
             </Button>
-            <Button onClick={goToEnd} disabled={moveHistory.length === 0}>
+            <Button onClick={goToEnd} disabled={history.length === 0}>
               <FontAwesomeIcon icon={faFastForward} />
             </Button>
           </Controls>
         </BoardContainer>
+
+        {isPlayingAI && (
+          <Timer>
+            <FontAwesomeIcon icon={faClock} /> {formatTime(stats.timeLeft)}
+          </Timer>
+        )}
+
+        <DifficultySelector>
+          <DifficultyButton
+            isActive={difficulty === 'beginner'}
+            onClick={() => handleDifficultyChange('beginner')}
+          >
+            Beginner
+          </DifficultyButton>
+          <DifficultyButton
+            isActive={difficulty === 'intermediate'}
+            onClick={() => handleDifficultyChange('intermediate')}
+          >
+            Intermediate
+          </DifficultyButton>
+          <DifficultyButton
+            isActive={difficulty === 'advanced'}
+            onClick={() => handleDifficultyChange('advanced')}
+          >
+            Advanced
+          </DifficultyButton>
+        </DifficultySelector>
+
+        <Controls>
+          <Button onClick={() => startAIGame('white')}>
+            <FontAwesomeIcon icon={faRobot} /> Play as White
+          </Button>
+          <Button onClick={() => startAIGame('black')}>
+            <FontAwesomeIcon icon={faRobot} /> Play as Black
+          </Button>
+        </Controls>
 
         <InputContainer>
           <Input
@@ -263,6 +601,31 @@ const ChessGameViewer: React.FC = () => {
             <FontAwesomeIcon icon={faSave} /> Save
           </Button>
         </InputContainer>
+
+        <GameStats>
+          <StatsTitle>
+            <FontAwesomeIcon icon={faTrophy} />
+            Game Statistics
+          </StatsTitle>
+          <StatsGrid>
+            <StatItem>
+              <StatValue>{stats.wins}</StatValue>
+              <StatLabel>Wins</StatLabel>
+            </StatItem>
+            <StatItem>
+              <StatValue>{stats.losses}</StatValue>
+              <StatLabel>Losses</StatLabel>
+            </StatItem>
+            <StatItem>
+              <StatValue>{stats.draws}</StatValue>
+              <StatLabel>Draws</StatLabel>
+            </StatItem>
+            <StatItem>
+              <StatValue>{((stats.wins / (stats.wins + stats.losses + stats.draws)) * 100 || 0).toFixed(1)}%</StatValue>
+              <StatLabel>Win Rate</StatLabel>
+            </StatItem>
+          </StatsGrid>
+        </GameStats>
       </MainSection>
 
       <SavedGames>
